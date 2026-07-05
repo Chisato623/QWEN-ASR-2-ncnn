@@ -1,11 +1,11 @@
 // Copyright 2026 Tencent
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Qwen3-ASR-1.7B speech recognition implemented with ncnn library
+// Qwen3-ASR-0.6B speech recognition implemented with ncnn library
 //
-// Put this executable in examples/Qwen3-ASR-1.7B or run it from that directory.
+// Put this executable in examples/Qwen3-ASR-0.6B or run it from that directory.
 // Usage:
-//   qwen_asr_1_7_b input.wav [language] [max-new-tokens]
+//   qwen3_asr input.wav [language] [max-new-tokens]
 
 #include "net.h"
 #include "layer.h"
@@ -35,9 +35,8 @@ static const int token_audio_start = 151669;
 static const int token_audio_end = 151670;
 static const int token_audio_pad = 151676;
 
-static const int qwen_hidden_size = 2048;
+static const int qwen_hidden_size = 1024;
 static const int qwen_num_layers = 28;
-static const int qwen_audio_hidden_size = 1024;
 static const int qwen_num_kv_heads = 8;
 static const int qwen_head_dim = 128;
 static const int qwen_prefill_len = 512;
@@ -704,7 +703,7 @@ static void fill_rope_cache_row(float* cosptr, float* sinptr, int position)
 
 static float audio_position_value(int position, int channel)
 {
-    const int half_dim = qwen_audio_hidden_size / 2;
+    const int half_dim = 896 / 2;
     const int freq_index = channel < half_dim ? channel : channel - half_dim;
     const float log_timescale_increment = logf(10000.f) / (half_dim - 1);
     const float inv_timescale = expf(-log_timescale_increment * freq_index);
@@ -816,24 +815,24 @@ int Qwen3ASR::load()
         register_qwen3_asr_custom_layers(decoder_step_layers[i]);
     }
 
-    if (load_ncnn_model(audio_cnn, "qwen3_asr_1_7b_audio_cnn.ncnn.param", "qwen3_asr_1_7b_audio_cnn.ncnn.bin") != 0) return -1;
-    if (load_ncnn_model(audio_transformer, "qwen3_asr_1_7b_audio_transformer.ncnn.param", "qwen3_asr_1_7b_audio_transformer.ncnn.bin") != 0) return -1;
-    if (load_ncnn_model(audio_proj, "qwen3_asr_1_7b_audio_proj.ncnn.param", "qwen3_asr_1_7b_audio_proj.ncnn.bin") != 0) return -1;
-    if (load_ncnn_model(text_embed, "qwen3_asr_1_7b_text_embed.ncnn.param", "qwen3_asr_1_7b_text_embed.ncnn.bin") != 0) return -1;
-    if (load_ncnn_model(text_norm, "qwen3_asr_1_7b_text_norm.ncnn.param", "qwen3_asr_1_7b_text_norm.ncnn.bin") != 0) return -1;
-    if (load_ncnn_model(lm_head, "qwen3_asr_1_7b_lm_head.ncnn.param", "qwen3_asr_1_7b_lm_head.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(audio_cnn, "qwen3_asr_0_6b_audio_cnn.ncnn.param", "qwen3_asr_0_6b_audio_cnn.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(audio_transformer, "qwen3_asr_0_6b_audio_transformer.ncnn.param", "qwen3_asr_0_6b_audio_transformer.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(audio_proj, "qwen3_asr_0_6b_audio_proj.ncnn.param", "qwen3_asr_0_6b_audio_proj.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(text_embed, "qwen3_asr_0_6b_text_embed.ncnn.param", "qwen3_asr_0_6b_text_embed.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(text_norm, "qwen3_asr_0_6b_text_norm.ncnn.param", "qwen3_asr_0_6b_text_norm.ncnn.bin") != 0) return -1;
+    if (load_ncnn_model(lm_head, "qwen3_asr_0_6b_lm_head.ncnn.param", "qwen3_asr_0_6b_lm_head.ncnn.bin") != 0) return -1;
 
     for (int i = 0; i < qwen_num_layers; i++)
     {
         char param[128];
         char bin[128];
-        sprintf(param, "qwen3_asr_1_7b_text_decoder_prefill_layer_%02d.ncnn.param", i);
-        sprintf(bin, "qwen3_asr_1_7b_text_decoder_prefill_layer_%02d.ncnn.bin", i);
+        sprintf(param, "qwen3_asr_0_6b_text_decoder_prefill_layer_%02d.ncnn.param", i);
+        sprintf(bin, "qwen3_asr_0_6b_text_decoder_prefill_layer_%02d.ncnn.bin", i);
         if (load_ncnn_model(decoder_prefill_layers[i], param, bin) != 0)
             return -1;
 
-        sprintf(param, "qwen3_asr_1_7b_text_decoder_step_layer_%02d.ncnn.param", i);
-        sprintf(bin, "qwen3_asr_1_7b_text_decoder_step_layer_%02d.ncnn.bin", i);
+        sprintf(param, "qwen3_asr_0_6b_text_decoder_step_layer_%02d.ncnn.param", i);
+        sprintf(bin, "qwen3_asr_0_6b_text_decoder_step_layer_%02d.ncnn.bin", i);
         if (load_ncnn_model(decoder_step_layers[i], param, bin) != 0)
             return -1;
     }
@@ -914,7 +913,7 @@ int Qwen3ASR::extract_fbank(const std::vector<short>& samples, ncnn::Mat& featur
 
 int Qwen3ASR::run_audio(const ncnn::Mat& features, int audio_token_count, ncnn::Mat& audio_embeds) const
 {
-    ncnn::Mat audio_states(qwen_audio_hidden_size, qwen_audio_max_tokens);
+    ncnn::Mat audio_states(896, qwen_audio_max_tokens);
     audio_states.fill(0.f);
     ncnn::Mat audio_mask(qwen_audio_max_tokens, qwen_audio_max_tokens, 1, 1);
     audio_mask.fill(-1e30f);
@@ -954,7 +953,7 @@ int Qwen3ASR::run_audio(const ncnn::Mat& features, int audio_token_count, ncnn::
             float* dst = audio_states.row(state_row + i);
             const int global_pos = state_row + i;
             const int local_pos = i;
-            for (int c = 0; c < qwen_audio_hidden_size; c++)
+            for (int c = 0; c < 896; c++)
                 dst[c] = src[c] + audio_position_value(local_pos, c) - audio_position_value(global_pos, c);
         }
         state_row += copy_rows;
