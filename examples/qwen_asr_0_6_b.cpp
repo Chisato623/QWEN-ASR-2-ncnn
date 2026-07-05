@@ -100,6 +100,7 @@ static void register_qwen3_asr_custom_layers(ncnn::Net& net)
 
 static int load_ncnn_model(ncnn::Net& net, const char* param, const char* bin)
 {
+    fprintf(stderr, "qwen asr: loading %s\n", param);
     int ret = net.load_param(param);
     if (ret != 0)
     {
@@ -107,6 +108,7 @@ static int load_ncnn_model(ncnn::Net& net, const char* param, const char* bin)
         return ret;
     }
 
+    fprintf(stderr, "qwen asr: loading %s\n", bin);
     ret = net.load_model(bin);
     if (ret != 0)
     {
@@ -114,6 +116,7 @@ static int load_ncnn_model(ncnn::Net& net, const char* param, const char* bin)
         return ret;
     }
 
+    fprintf(stderr, "qwen asr: loaded %s\n", bin);
     return 0;
 }
 
@@ -124,10 +127,12 @@ static int qwen_asr_gpu_device()
     if (selected_gpu_device != -2)
         return selected_gpu_device;
 
-    int requested_gpu_device = 0;
+    int requested_gpu_device = -1;
     const char* env_gpu_device = getenv("NCNN_QWEN_ASR_GPU");
     if (env_gpu_device && env_gpu_device[0])
         requested_gpu_device = atoi(env_gpu_device);
+    else
+        fprintf(stderr, "qwen asr: vulkan disabled by default because it may produce incorrect text; set NCNN_QWEN_ASR_GPU=0 to test vulkan\n");
 
     if (requested_gpu_device < 0)
     {
@@ -1362,3 +1367,4 @@ int main(int argc, char** argv)
 
     return 0;
 }
+

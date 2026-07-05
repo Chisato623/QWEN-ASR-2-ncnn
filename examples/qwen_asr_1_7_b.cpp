@@ -125,10 +125,12 @@ static int qwen_asr_gpu_device()
     if (selected_gpu_device != -2)
         return selected_gpu_device;
 
-    int requested_gpu_device = 0;
+    int requested_gpu_device = -1;
     const char* env_gpu_device = getenv("NCNN_QWEN_ASR_GPU");
     if (env_gpu_device && env_gpu_device[0])
         requested_gpu_device = atoi(env_gpu_device);
+    else
+        fprintf(stderr, "qwen asr: vulkan disabled by default because it may produce incorrect text; set NCNN_QWEN_ASR_GPU=0 to test vulkan\n");
 
     if (requested_gpu_device < 0)
     {
@@ -1363,3 +1365,4 @@ int main(int argc, char** argv)
 
     return 0;
 }
+
