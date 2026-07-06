@@ -799,14 +799,6 @@ int Qwen3ASR::load()
     configure_qwen_asr_net(audio_cnn);
     configure_qwen_asr_net(audio_transformer);
     configure_qwen_asr_net(audio_proj);
-    configure_qwen_asr_net(text_embed);
-    configure_qwen_asr_net(text_norm);
-    configure_qwen_asr_net(lm_head);
-    for (int i = 0; i < qwen_num_layers; i++)
-    {
-        configure_qwen_asr_net(decoder_prefill_layers[i]);
-        configure_qwen_asr_net(decoder_step_layers[i]);
-    }
 
     register_qwen3_asr_custom_layers(audio_cnn);
     register_qwen3_asr_custom_layers(audio_transformer);
