@@ -22,6 +22,7 @@
 #include <string.h>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -167,20 +168,56 @@ static int qwen_asr_gpu_device()
 #endif
 }
 
-static void configure_qwen_asr_net(ncnn::Net& net)
+static bool qwen_asr_gpu_fp16_enabled()
+{
+#if NCNN_VULKAN
+    static int enabled = -1;
+    if (enabled != -1)
+        return enabled != 0;
+
+    const char* env_fp16 = getenv("NCNN_QWEN_ASR_FP16");
+    enabled = env_fp16 && env_fp16[0] && atoi(env_fp16) != 0 ? 1 : 0;
+    if (!enabled)
+        fprintf(stderr, "qwen asr: vulkan fp16 disabled by default for closer cpu text matching; set NCNN_QWEN_ASR_FP16=1 to test fp16\n");
+    return enabled != 0;
+#else
+    return false;
+#endif
+}
+
+static int qwen_asr_env_int(const char* name, int default_value)
+{
+    const char* value = getenv(name);
+    if (!value || !value[0])
+        return default_value;
+    return atoi(value);
+}
+
+static void configure_qwen_asr_net(ncnn::Net& net, const char* name)
 {
 #if NCNN_VULKAN
     const int gpu_device = qwen_asr_gpu_device();
     if (gpu_device >= 0)
     {
+        const bool use_fp16 = qwen_asr_gpu_fp16_enabled();
         net.opt.use_vulkan_compute = true;
-        net.opt.use_fp16_packed = true;
-        net.opt.use_fp16_storage = true;
-        net.opt.use_fp16_arithmetic = true;
+        net.opt.use_fp16_packed = use_fp16;
+        net.opt.use_fp16_storage = use_fp16;
+        net.opt.use_fp16_arithmetic = use_fp16;
         net.opt.use_packing_layout = true;
         net.set_vulkan_device(gpu_device);
+        fprintf(stderr, "qwen asr: enable vulkan for %s fp16=%d\n", name, use_fp16 ? 1 : 0);
     }
+#else
+    (void)net;
+    (void)name;
 #endif
+}
+
+static void configure_qwen_asr_cpu_net(ncnn::Net& net, const char* name)
+{
+    (void)net;
+    (void)name;
 }
 
 static ncnn::Mat make_zero_kv_cache()
@@ -555,6 +592,45 @@ static int load_wav_samples(const char* wavpath, std::vector<short>& samples)
     return 0;
 }
 
+static std::string csv_escape(const std::string& s)
+{
+    bool need_quote = false;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        if (s[i] == '"' || s[i] == ',' || s[i] == '\n' || s[i] == '\r')
+        {
+            need_quote = true;
+            break;
+        }
+    }
+
+    if (!need_quote)
+        return s;
+
+    std::string out = "\"";
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        if (s[i] == '"')
+            out += "\"\"";
+        else
+            out += s[i];
+    }
+    out += "\"";
+    return out;
+}
+
+static int split_tsv_line(const std::string& line, std::string& audio_path, std::string& relpath)
+{
+    size_t tab = line.find('\t');
+    if (tab == std::string::npos)
+        return -1;
+    audio_path = line.substr(0, tab);
+    relpath = line.substr(tab + 1);
+    while (!relpath.empty() && (relpath.back() == '\n' || relpath.back() == '\r'))
+        relpath.pop_back();
+    return 0;
+}
+
 static std::string trim_ascii_space(const std::string& s)
 {
     size_t begin = 0;
@@ -794,9 +870,51 @@ private:
 
 int Qwen3ASR::load()
 {
-    configure_qwen_asr_net(audio_cnn);
-    configure_qwen_asr_net(audio_transformer);
-    configure_qwen_asr_net(audio_proj);
+    configure_qwen_asr_net(audio_cnn, "audio_cnn");
+    configure_qwen_asr_net(audio_transformer, "audio_transformer");
+    configure_qwen_asr_net(audio_proj, "audio_proj");
+
+    const int text_gpu = qwen_asr_env_int("NCNN_QWEN_ASR_TEXT_GPU", 0);
+    const int text_embed_gpu = qwen_asr_env_int("NCNN_QWEN_ASR_TEXT_EMBED_GPU", text_gpu);
+    const int text_head_gpu = qwen_asr_env_int("NCNN_QWEN_ASR_TEXT_HEAD_GPU", text_gpu);
+    const int prefill_gpu_layers = std::min(qwen_num_layers, std::max(0, qwen_asr_env_int("NCNN_QWEN_ASR_PREFILL_GPU_LAYERS", text_gpu ? qwen_num_layers : 0)));
+    const int step_gpu_layers = std::min(qwen_num_layers, std::max(0, qwen_asr_env_int("NCNN_QWEN_ASR_STEP_GPU_LAYERS", text_gpu ? qwen_num_layers : 0)));
+
+    if (text_gpu || text_embed_gpu || text_head_gpu || prefill_gpu_layers || step_gpu_layers)
+        fprintf(stderr, "qwen asr: text vulkan requested embed=%d head=%d prefill_layers=%d step_layers=%d\n", text_embed_gpu, text_head_gpu, prefill_gpu_layers, step_gpu_layers);
+    else
+        fprintf(stderr, "qwen asr: text vulkan disabled by default for stable recognition; set NCNN_QWEN_ASR_TEXT_GPU=1 to test it\n");
+
+    if (text_embed_gpu)
+        configure_qwen_asr_net(text_embed, "text_embed");
+    else
+        configure_qwen_asr_cpu_net(text_embed, "text_embed");
+
+    if (text_head_gpu)
+    {
+        configure_qwen_asr_net(text_norm, "text_norm");
+        configure_qwen_asr_net(lm_head, "lm_head");
+    }
+    else
+    {
+        configure_qwen_asr_cpu_net(text_norm, "text_norm");
+        configure_qwen_asr_cpu_net(lm_head, "lm_head");
+    }
+
+    for (int i = 0; i < qwen_num_layers; i++)
+    {
+        char name[64];
+        sprintf(name, "decoder_prefill_layer_%02d", i);
+        if (i < prefill_gpu_layers)
+            configure_qwen_asr_net(decoder_prefill_layers[i], name);
+        else
+            configure_qwen_asr_cpu_net(decoder_prefill_layers[i], name);
+        sprintf(name, "decoder_step_layer_%02d", i);
+        if (i < step_gpu_layers)
+            configure_qwen_asr_net(decoder_step_layers[i], name);
+        else
+            configure_qwen_asr_cpu_net(decoder_step_layers[i], name);
+    }
 
     register_qwen3_asr_custom_layers(audio_cnn);
     register_qwen3_asr_custom_layers(audio_transformer);
@@ -1320,7 +1438,96 @@ int main(int argc, char** argv)
     if (argc < 2)
     {
         fprintf(stderr, "Usage: %s [wavpath] [language] [max-new-tokens=128]\n", argv[0]);
+        fprintf(stderr, "       %s --batch audio_list.tsv output.csv [max-new-tokens=128]\n", argv[0]);
         return -1;
+    }
+
+    if (strcmp(argv[1], "--batch") == 0)
+    {
+        if (argc < 4)
+        {
+            fprintf(stderr, "Usage: %s --batch audio_list.tsv output.csv [max-new-tokens=128]\n", argv[0]);
+            return -1;
+        }
+
+        const char* list_path = argv[2];
+        const char* output_path = argv[3];
+        int max_new_tokens = 128;
+        if (argc >= 5)
+            max_new_tokens = atoi(argv[4]);
+
+        std::ifstream list_fp(list_path);
+        if (!list_fp)
+        {
+            fprintf(stderr, "open %s failed\n", list_path);
+            return -1;
+        }
+
+        std::ofstream out_fp(output_path);
+        if (!out_fp)
+        {
+            fprintf(stderr, "open %s failed\n", output_path);
+            return -1;
+        }
+
+        fprintf(stderr, "qwen asr: batch loading model once\n");
+        std::chrono::steady_clock::time_point load_begin = std::chrono::steady_clock::now();
+        Qwen3ASR asr;
+        if (asr.load() != 0)
+            return -1;
+        std::chrono::steady_clock::time_point load_end = std::chrono::steady_clock::now();
+        double load_seconds = std::chrono::duration<double>(load_end - load_begin).count();
+        fprintf(stderr, "qwen asr: batch model load elapsed %.3f s\n", load_seconds);
+
+        out_fp << "audio_relpath,ok,time_sec,language,text,error\n";
+
+        std::string line;
+        int index = 0;
+        while (std::getline(list_fp, line))
+        {
+            if (line.empty())
+                continue;
+
+            std::string audio_path;
+            std::string relpath;
+            if (split_tsv_line(line, audio_path, relpath) != 0)
+                continue;
+
+            index++;
+            fprintf(stderr, "qwen asr: batch [%d] %s\n", index, relpath.c_str());
+
+            std::string text;
+            std::string detected_language;
+            std::string error;
+            bool ok = false;
+
+            std::chrono::steady_clock::time_point infer_begin = std::chrono::steady_clock::now();
+            std::vector<short> samples;
+            if (load_wav_samples(audio_path.c_str(), samples) != 0)
+            {
+                error = "load_wav_samples failed";
+            }
+            else if (asr.transcribe(samples, "", max_new_tokens, text, detected_language) != 0)
+            {
+                error = "transcribe failed";
+            }
+            else
+            {
+                ok = true;
+            }
+            std::chrono::steady_clock::time_point infer_end = std::chrono::steady_clock::now();
+            double infer_seconds = std::chrono::duration<double>(infer_end - infer_begin).count();
+
+            out_fp << csv_escape(relpath) << ','
+                   << (ok ? "true" : "false") << ','
+                   << infer_seconds << ','
+                   << csv_escape(detected_language) << ','
+                   << csv_escape(text) << ','
+                   << csv_escape(error) << '\n';
+            out_fp.flush();
+        }
+
+        return 0;
     }
 
     const char* language = "";
