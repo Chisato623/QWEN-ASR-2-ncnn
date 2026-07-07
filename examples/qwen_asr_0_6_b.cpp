@@ -128,12 +128,12 @@ static int qwen_asr_gpu_device()
     if (selected_gpu_device != -2)
         return selected_gpu_device;
 
-    int requested_gpu_device = -1;
+    int requested_gpu_device = 0;
     const char* env_gpu_device = getenv("NCNN_QWEN_ASR_GPU");
     if (env_gpu_device && env_gpu_device[0])
         requested_gpu_device = atoi(env_gpu_device);
     else
-        fprintf(stderr, "qwen asr: vulkan disabled by default because it may produce incorrect text; set NCNN_QWEN_ASR_GPU=0 to test vulkan\n");
+        fprintf(stderr, "qwen asr: try vulkan gpu 0 for audio encoder by default; set NCNN_QWEN_ASR_GPU=-1 to force cpu\n");
 
     if (requested_gpu_device < 0)
     {
@@ -772,10 +772,19 @@ static int get_audio_chunk_aftercnn_length(int chunk_length)
 static void fill_rope_cache_row(float* cosptr, float* sinptr, int position)
 {
     const int half_head_dim = qwen_head_dim / 2;
+    static float inv_freq_table[qwen_head_dim / 2];
+    static bool inv_freq_ready = false;
+    if (!inv_freq_ready)
+    {
+        for (int i = 0; i < half_head_dim; i++)
+            inv_freq_table[i] = powf(qwen_rope_theta, -(float)(2 * i) / qwen_head_dim);
+        inv_freq_ready = true;
+    }
+
     for (int j = 0; j < qwen_head_dim; j++)
     {
         const int freq_index = j % half_head_dim;
-        float inv_freq = powf(qwen_rope_theta, -(float)(2 * freq_index) / qwen_head_dim);
+        float inv_freq = inv_freq_table[freq_index];
         float v = position * inv_freq;
         cosptr[j] = cosf(v);
         sinptr[j] = sinf(v);
@@ -790,6 +799,23 @@ static float audio_position_value(int position, int channel)
     const float inv_timescale = expf(-log_timescale_increment * freq_index);
     const float scaled_time = position * inv_timescale;
     return channel < half_dim ? sinf(scaled_time) : cosf(scaled_time);
+}
+
+static const float* audio_position_row(int position)
+{
+    static std::vector<float> table;
+    if (table.empty())
+    {
+        table.resize(qwen_audio_max_tokens * 896);
+        for (int p = 0; p < qwen_audio_max_tokens; p++)
+        {
+            float* row = table.data() + p * 896;
+            for (int c = 0; c < 896; c++)
+                row[c] = audio_position_value(p, c);
+        }
+    }
+
+    return table.data() + position * 896;
 }
 
 static bool extract_language_header(const std::string& text, std::string& language, std::string& body)
@@ -854,6 +880,7 @@ private:
     int run_audio(const ncnn::Mat& features, int audio_token_count, ncnn::Mat& audio_embeds) const;
     int decode(const ncnn::Mat& audio_embeds, const char* language, int max_new_tokens, std::string& text) const;
     int token_embed(int token, ncnn::Mat& hidden) const;
+    int token_embed_batch(const std::vector<int>& tokens, ncnn::Mat& hidden) const;
     int run_text_prefill(const ncnn::Mat& hidden, int valid_tokens, ncnn::Mat& logits, std::vector<ncnn::Mat>& cache) const;
     int run_text_step(const ncnn::Mat& hidden, int position, std::vector<ncnn::Mat>& cache, ncnn::Mat& logits) const;
 
@@ -1068,8 +1095,10 @@ int Qwen3ASR::run_audio(const ncnn::Mat& features, int audio_token_count, ncnn::
             float* dst = audio_states.row(state_row + i);
             const int global_pos = state_row + i;
             const int local_pos = i;
+            const float* local_position = audio_position_row(local_pos);
+            const float* global_position = audio_position_row(global_pos);
             for (int c = 0; c < 896; c++)
-                dst[c] = src[c] + audio_position_value(local_pos, c) - audio_position_value(global_pos, c);
+                dst[c] = src[c] + local_position[c] - global_position[c];
         }
         state_row += copy_rows;
 
@@ -1121,6 +1150,20 @@ int Qwen3ASR::token_embed(int token, ncnn::Mat& hidden) const
     ((int*)input)[0] = token;
     ncnn::Extractor ex = text_embed.create_extractor();
     ex.input("in0", input);
+    return ex.extract("out0", hidden);
+}
+
+int Qwen3ASR::token_embed_batch(const std::vector<int>& tokens, ncnn::Mat& hidden) const
+{
+    ncnn::Mat input((int)tokens.size());
+    int* ptr = (int*)input;
+    for (size_t i = 0; i < tokens.size(); i++)
+        ptr[i] = tokens[i];
+
+    ncnn::Extractor ex = text_embed.create_extractor();
+    int ret = ex.input("in0", input);
+    if (ret != 0)
+        return ret;
     return ex.extract("out0", hidden);
 }
 
@@ -1208,18 +1251,18 @@ int Qwen3ASR::run_text_step(const ncnn::Mat& hidden0, int position, std::vector<
     const int cache_pos = position % qwen_prefill_len;
     const int visible = std::min(position, qwen_prefill_len);
 
+    ncnn::Mat cos_cache(qwen_head_dim, 1);
+    ncnn::Mat sin_cache(qwen_head_dim, 1);
+    fill_rope_cache_row(cos_cache, sin_cache, position);
+
+    ncnn::Mat mask(qwen_prefill_len + 1, 1, 1);
+    float* maskptr = mask;
+    for (int j = 0; j < qwen_prefill_len; j++)
+        maskptr[j] = j < visible ? 0.f : -1e30f;
+    maskptr[qwen_prefill_len] = 0.f;
+
     for (int i = 0; i < qwen_num_layers; i++)
     {
-        ncnn::Mat cos_cache(qwen_head_dim, 1);
-        ncnn::Mat sin_cache(qwen_head_dim, 1);
-        fill_rope_cache_row(cos_cache, sin_cache, position);
-
-        ncnn::Mat mask(qwen_prefill_len + 1, 1, 1);
-        float* maskptr = mask;
-        for (int j = 0; j < qwen_prefill_len; j++)
-            maskptr[j] = j < visible ? 0.f : -1e30f;
-        maskptr[qwen_prefill_len] = 0.f;
-
         ncnn::Extractor ex = decoder_step_layers[i].create_extractor();
         int ret = 0;
         ret |= ex.input("in0", hidden);
@@ -1316,12 +1359,15 @@ int Qwen3ASR::decode(const ncnn::Mat& audio_embeds, const char* language, int ma
         return -1;
     }
 
-    ncnn::Mat prefill_hidden(qwen_hidden_size, qwen_prefill_len);
-    ncnn::Mat pad_hidden;
-    if (token_embed(token_endoftext, pad_hidden) != 0)
+    std::vector<int> embed_tokens(qwen_prefill_len, token_endoftext);
+    for (int i = 0; i < (int)prompt.size(); i++)
+        embed_tokens[i] = prompt[i] == token_audio_pad ? token_endoftext : prompt[i];
+
+    ncnn::Mat prefill_hidden;
+    if (token_embed_batch(embed_tokens, prefill_hidden) != 0)
         return -1;
-    for (int i = 0; i < qwen_prefill_len; i++)
-        memcpy(prefill_hidden.row(i), pad_hidden.row(0), qwen_hidden_size * sizeof(float));
+    prefill_hidden = prefill_hidden.reshape(qwen_hidden_size, qwen_prefill_len);
+
     int audio_index = 0;
     for (int i = 0; i < (int)prompt.size(); i++)
     {
@@ -1331,14 +1377,6 @@ int Qwen3ASR::decode(const ncnn::Mat& audio_embeds, const char* language, int ma
             audio_index++;
             continue;
         }
-
-        ncnn::Mat hidden;
-        if (token_embed(prompt[i], hidden) != 0)
-        {
-            fprintf(stderr, "token_embed failed id=%d\n", prompt[i]);
-            return -1;
-        }
-        memcpy(prefill_hidden.row(i), hidden.row(0), qwen_hidden_size * sizeof(float));
     }
 
     std::vector<ncnn::Mat> cache;
